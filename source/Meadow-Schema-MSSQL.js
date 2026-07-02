@@ -79,6 +79,12 @@ class MeadowSchemaMSSQL extends libFableServiceProviderBase
 				InitialDelayMs: tmpRetry.InitialDelayMs || DEFAULT_DDL_INITIAL_DELAY,
 				MaxDelayMs: tmpRetry.MaxDelayMs || DEFAULT_DDL_MAX_DELAY,
 				BackoffFactor: tmpRetry.BackoffFactor || 2,
+				// DDL (e.g. CREATE INDEX on a large table) can legitimately run
+				// long, so the hard wall-clock guard is opt-in here — a too-tight
+				// cap would abort a real index build and re-abort it every retry.
+				// Set MSSQL.DDLRetryOptions.OperationTimeoutMs where the DDL is
+				// known to be bounded.  0 = rely on retries + pool recycle only.
+				OperationTimeoutMs: tmpRetry.OperationTimeoutMs || 0,
 				// "AlreadyExists" is always treated as success for DDL — a
 				// re-deploy will naturally hit tables that already exist.
 				SuccessModes: [libRetry.ERROR_MODES.AlreadyExists]
@@ -491,6 +497,42 @@ class MeadowSchemaMSSQL extends libFableServiceProviderBase
 				{
 					this.log.info(`Meadow-MSSQL CREATE INDEX ${pIndexStatement.Name} executed successfully.`);
 				}
+				return fCallback();
+			});
+	}
+
+	/**
+	 * Programmatically drop a single index if it exists (idempotent).
+	 *
+	 * @param {string} pTableName
+	 * @param {string} pIndexName
+	 * @param {Function} fCallback - callback(pError)
+	 */
+	dropIndex(pTableName, pIndexName, fCallback)
+	{
+		if (!this._ConnectionPool)
+		{
+			this.log.error(`Meadow-MSSQL DROP INDEX ${pIndexName} failed: not connected.`);
+			return fCallback(new Error('Not connected to MSSQL'));
+		}
+
+		let tmpStatement = `DROP INDEX IF EXISTS [${pIndexName}] ON [dbo].[${pTableName}]`;
+
+		libRetry.runWithRetry(this.log,
+			this._ddlRetryOptions(`Meadow-MSSQL DROP INDEX ${pIndexName}`),
+			(fAttemptDone) =>
+			{
+				this._ConnectionPool.query(tmpStatement)
+					.then(() => { return fAttemptDone(null); })
+					.catch((pDropError) => { return fAttemptDone(pDropError); });
+			},
+			(pError) =>
+			{
+				if (pError)
+				{
+					return fCallback(pError);
+				}
+				this.log.info(`Meadow-MSSQL DROP INDEX ${pIndexName} on ${pTableName} executed.`);
 				return fCallback();
 			});
 	}

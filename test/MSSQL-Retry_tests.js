@@ -347,5 +347,95 @@ suite('Meadow-MSSQL-Retry',
 								} catch (e) { fDone(e); }
 							});
 					});
+
+				test('hard OperationTimeoutMs fires when the operation never calls back, then retries',
+					(fDone) =>
+					{
+						let log = makeTestLogger();
+						let tmpCalls = 0;
+						libRetry.runWithRetry(log,
+							{ OperationName: 'hung-op', MaxAttempts: 3, InitialDelayMs: 5, OperationTimeoutMs: 25 },
+							(fAttemptDone) =>
+							{
+								tmpCalls++;
+								// First attempt wedges (never calls back); the hard guard must
+								// synthesize a timeout so the retry can happen.  Later attempts succeed.
+								if (tmpCalls === 1)
+								{
+									return;
+								}
+								return fAttemptDone(null, 'recovered');
+							},
+							(err, result) =>
+							{
+								try {
+									Expect(err).to.be.null;
+									Expect(result).to.equal('recovered');
+									// Retrying at all proves the guard fired — attempt 1 never called
+									// back, so without the hard timeout this would hang forever.
+									Expect(tmpCalls).to.equal(2);
+									let tmpTimedOut = log.records.filter((r) => r.message.indexOf('RequestTimeout') >= 0);
+									Expect(tmpTimedOut.length).to.be.at.least(1);
+									fDone();
+								} catch (e) { fDone(e); }
+							});
+					});
+
+				test('a late real callback after the hard timeout is ignored (no double-settle)',
+					(fDone) =>
+					{
+						let log = makeTestLogger();
+						let tmpFinalCallbacks = 0;
+						libRetry.runWithRetry(log,
+							{ OperationName: 'late-op', MaxAttempts: 1, InitialDelayMs: 5, OperationTimeoutMs: 20 },
+							(fAttemptDone) =>
+							{
+								// Real callback arrives well after the guard has already fired.
+								setTimeout(() => fAttemptDone(null, 'too-late'), 60);
+							},
+							(err) =>
+							{
+								tmpFinalCallbacks++;
+								// The guard timed out attempt 1; MaxAttempts=1 so it propagates the error.
+								if (tmpFinalCallbacks === 1)
+								{
+									// Wait past the late callback (60ms) and assert it was ignored.
+									setTimeout(() =>
+									{
+										try {
+											Expect(err).to.be.an('error');
+											Expect(err.code).to.equal('ETIMEOUT');
+											Expect(tmpFinalCallbacks).to.equal(1);
+											fDone();
+										} catch (e) { fDone(e); }
+									}, 90);
+								}
+							});
+					});
+
+				test('OperationTimeoutMs default (0) disables the guard — a slow op still succeeds',
+					(fDone) =>
+					{
+						let log = makeTestLogger();
+						let tmpCalls = 0;
+						libRetry.runWithRetry(log,
+							{ OperationName: 'slow-but-fine', MaxAttempts: 2, InitialDelayMs: 5 },
+							(fAttemptDone) =>
+							{
+								tmpCalls++;
+								setTimeout(() => fAttemptDone(null, 'ok'), 40);
+							},
+							(err, result) =>
+							{
+								try {
+									Expect(err).to.be.null;
+									Expect(result).to.equal('ok');
+									Expect(tmpCalls).to.equal(1);
+									let tmpTimedOut = log.records.filter((r) => r.message.indexOf('hard timeout') >= 0);
+									Expect(tmpTimedOut.length).to.equal(0);
+									fDone();
+								} catch (e) { fDone(e); }
+							});
+					});
 			});
 	});

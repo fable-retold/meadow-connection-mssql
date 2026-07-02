@@ -43,7 +43,13 @@ const DEFAULT_RETRY_OPTIONS =
 	InitialDelayMs: 2000,
 	MaxDelayMs: 30000,
 	BackoffFactor: 2,
-	PoolRecycleModes: ['NetworkError', 'RequestTimeout', 'PoolDegraded']
+	PoolRecycleModes: ['NetworkError', 'RequestTimeout', 'PoolDegraded'],
+	// Hard wall-clock ceiling per attempt.  0 disables it (legacy behavior).
+	// The mssql driver's own requestTimeout normally fires first; this is the
+	// backstop for the case where the driver's callback never arrives at all
+	// (a wedged socket, a pool acquire that never resolves), which otherwise
+	// hangs the whole operation — and any sync walking it — forever.
+	OperationTimeoutMs: 0
 };
 
 /**
@@ -258,11 +264,27 @@ function runWithRetry(pLog, pOptions, fOperation, fCallback)
 	{
 		tmpAttempt++;
 		let tmpStartMs = Date.now();
+		let tmpSettled = false;
+		let tmpTimeoutHandle = null;
 
 		pLog.info(`${tmpOpName}: attempt ${tmpAttempt}/${tmpOptions.MaxAttempts} starting...`);
 
-		fOperation((pError, pResult) =>
+		let fHandleOutcome = (pError, pResult) =>
 		{
+			// Exactly one outcome per attempt: whichever of the operation
+			// callback or the hard-timeout guard fires first wins; the other is
+			// a no-op.
+			if (tmpSettled)
+			{
+				return;
+			}
+			tmpSettled = true;
+			if (tmpTimeoutHandle)
+			{
+				clearTimeout(tmpTimeoutHandle);
+				tmpTimeoutHandle = null;
+			}
+
 			let tmpElapsedMs = Date.now() - tmpStartMs;
 
 			if (!pError)
@@ -332,7 +354,29 @@ function runWithRetry(pLog, pOptions, fOperation, fCallback)
 			}
 
 			fScheduleRetry();
-		});
+		};
+
+		// Arm the hard wall-clock guard for this attempt.  If the operation's
+		// callback never arrives (driver requestTimeout didn't fire — wedged
+		// socket / stuck pool acquire), synthesize an ETIMEOUT so the normal
+		// classify -> recycle-pool -> retry path runs instead of hanging.  A late
+		// real callback is ignored via tmpSettled inside fHandleOutcome.
+		if (tmpOptions.OperationTimeoutMs > 0)
+		{
+			tmpTimeoutHandle = setTimeout(() =>
+			{
+				let tmpTimeoutError = new Error(`operation exceeded hard timeout of ${(tmpOptions.OperationTimeoutMs / 1000).toFixed(0)}s with no driver response`);
+				tmpTimeoutError.code = 'ETIMEOUT';
+				fHandleOutcome(tmpTimeoutError);
+			}, tmpOptions.OperationTimeoutMs);
+			// The guard timer must not, by itself, keep the process alive.
+			if (tmpTimeoutHandle && typeof(tmpTimeoutHandle.unref) === 'function')
+			{
+				tmpTimeoutHandle.unref();
+			}
+		}
+
+		fOperation(fHandleOutcome);
 	};
 
 	fTryOnce();
