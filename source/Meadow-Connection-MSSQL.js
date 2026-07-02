@@ -161,6 +161,11 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 		return this._SchemaProvider.createIndex(pIndexStatement, fCallback);
 	}
 
+	dropIndex(pTableName, pIndexName, fCallback)
+	{
+		return this._SchemaProvider.dropIndex(pTableName, pIndexName, fCallback);
+	}
+
 	createIndices(pMeadowTableSchema, fCallback)
 	{
 		return this._SchemaProvider.createIndices(pMeadowTableSchema, fCallback);
@@ -272,6 +277,9 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 	{
 		let tmpMSSQLSettings = this.options.MSSQL || {};
 		let tmpRetry = tmpMSSQLSettings.ConnectRetryOptions || {};
+		let tmpConnectionTimeoutMs = tmpMSSQLSettings.ConnectionTimeoutMs
+			|| tmpMSSQLSettings.connectionTimeoutMs
+			|| DEFAULT_CONNECTION_TIMEOUT_MS;
 		return (
 			{
 				OperationName: `Meadow-MSSQL connect to [${tmpMSSQLSettings.server}:${tmpMSSQLSettings.port || 1433}]`,
@@ -279,6 +287,12 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 				InitialDelayMs: tmpRetry.InitialDelayMs || DEFAULT_CONNECT_INITIAL_DELAY,
 				MaxDelayMs: tmpRetry.MaxDelayMs || DEFAULT_CONNECT_MAX_DELAY,
 				BackoffFactor: tmpRetry.BackoffFactor || 2,
+				// Hard wall-clock backstop per connect attempt.  The driver's
+				// connectionTimeout normally fires first, but a wedged TCP
+				// handshake can leave the connect callback pending forever; give
+				// the guard the driver timeout plus headroom so the driver still
+				// reports first in the normal case.
+				OperationTimeoutMs: tmpRetry.OperationTimeoutMs || (tmpConnectionTimeoutMs + 30000)
 				// Connection-establishment retries never recycle a pool
 				// (there isn't one yet).  OnRecyclePool is intentionally
 				// absent here.
@@ -397,11 +411,31 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 		fCloseAndReconnect();
 	}
 
+	/**
+	 * Resolve the configured per-request (per-query) timeout in milliseconds.
+	 * @returns {number}
+	 */
+	_requestTimeoutMs()
+	{
+		let tmpMSSQLSettings = this.options.MSSQL || {};
+		return tmpMSSQLSettings.RequestTimeoutMs
+			|| tmpMSSQLSettings.requestTimeoutMs
+			|| DEFAULT_REQUEST_TIMEOUT_MS;
+	}
+
 	get preparedStatement()
 	{
 		if (this.connected && this._ConnectionPool)
 		{
-			return new libMSSQL.PreparedStatement(this._ConnectionPool);
+			// Bound the per-statement request timeout for all DML via the
+			// documented constructor override — mssql applies it to the prepare,
+			// execute, and unprepare operations.  The driver only reads this
+			// `overrides` argument; assigning ps.requestTimeout after construction
+			// has no effect.  Absent an override the statement would inherit the
+			// pool's requestTimeout; setting it here keeps the DML ceiling explicit
+			// and independent of pool config.  A wedged socket that the driver's own
+			// timer can't service is caught by the headless stall detector.
+			return new libMSSQL.PreparedStatement(this._ConnectionPool, { requestTimeout: this._requestTimeoutMs() });
 		}
 		else
 		{
@@ -412,6 +446,18 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 	get MSSQL()
 	{
 		return libMSSQL;
+	}
+
+	/**
+	 * The configured connection pool size (max connections).  Exposed so
+	 * pool-aware consumers (e.g. the sync engine's per-record fan-out) can
+	 * default their concurrency to the pool size and avoid oversubscribing it.
+	 * @returns {number}
+	 */
+	get connectionPoolLimit()
+	{
+		let tmpMSSQLSettings = this.options.MSSQL || {};
+		return tmpMSSQLSettings.ConnectionPoolLimit || 10;
 	}
 
 	get pool()
