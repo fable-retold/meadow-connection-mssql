@@ -189,6 +189,7 @@ class MeadowSchemaMSSQL extends libFableServiceProviderBase
 					tmpCreateTableStatement += `        [${tmpColumn.StorageColumn}] NVARCHAR(MAX)`;
 					break;
 				default:
+					this.log.error(`Meadow-MSSQL ${pMeadowTableSchema.TableName}.${tmpColumn.Column} has unsupported DataType [${tmpColumn.DataType}]; no column definition was emitted and the generated DDL will be malformed.`);
 					break;
 			}
 		}
