@@ -10,11 +10,22 @@
 const libFableServiceProviderBase = require('fable-serviceproviderbase');
 
 const libRetry = require('./Meadow-MSSQL-Retry.js');
+const libMSSQL = require('mssql');
 
 // Default retry behavior for DDL operations.  CREATE TABLE and CREATE
 // INDEX against a heavily-used MSSQL instance can hit schema locks held
 // by unrelated transactions; retry with exponential backoff so a busy
 // server window doesn't kill a whole deploy.
+// A schema change is not a query. CREATE INDEX over a large, already-populated
+// table legitimately runs for many minutes, and it only has to succeed once --
+// so DDL gets its own ceiling instead of inheriting the pool's per-query one.
+const DEFAULT_DDL_REQUEST_TIMEOUT_MS = 1800000;  // 30 min per DDL statement
+// How often a long-running DDL statement reports that it is still alive. Silence
+// is indistinguishable from a wedge to anything watching the log (see the data
+// cloner's pipeline watchdog), and an operator staring at a 20 minute gap has no
+// way to tell either.
+const DDL_PROGRESS_LOG_INTERVAL_MS = 60000;
+
 const DEFAULT_DDL_MAX_ATTEMPTS   = 5;
 const DEFAULT_DDL_INITIAL_DELAY  = 3000;
 const DEFAULT_DDL_MAX_DELAY      = 30000;
@@ -67,6 +78,121 @@ class MeadowSchemaMSSQL extends libFableServiceProviderBase
 	 * @param {string} pOperationName - name to use in log output
 	 * @returns {Object}
 	 */
+	/**
+	 * The per-statement ceiling for DDL, in ms.
+	 *
+	 * Deliberately NOT the pool's requestTimeout: that value is sized for
+	 * queries, and the pool hands it to every request it creates. Bounding a
+	 * schema change by a query budget is what made a legitimate index build
+	 * abort at two minutes and re-abort on every retry.
+	 *
+	 * @return {number} Milliseconds; 0 means no client-side ceiling.
+	 */
+	_ddlRequestTimeoutMs()
+	{
+		let tmpMSSQLSettings = this.options.MSSQL || this.fable.settings.MSSQL || {};
+		let tmpRetry = tmpMSSQLSettings.DDLRetryOptions || {};
+		if (typeof(tmpRetry.RequestTimeoutMs) === 'number' && tmpRetry.RequestTimeoutMs >= 0)
+		{
+			return tmpRetry.RequestTimeoutMs;
+		}
+		return DEFAULT_DDL_REQUEST_TIMEOUT_MS;
+	}
+
+	/**
+	 * Promise-shaped _executeDDLStatement, so the DDL call sites keep the
+	 * .then/.catch shape they already had.
+	 *
+	 * @param {string} pStatement - The DDL SQL to execute.
+	 * @param {string} pOperationName - Label for the progress lines.
+	 * @return {Promise<Object>} Resolves with the driver result.
+	 */
+	_executeDDLStatementPromise(pStatement, pOperationName)
+	{
+		return new Promise((fResolve, fReject) =>
+			{
+				this._executeDDLStatement(pStatement, pOperationName,
+					(pError, pResult) =>
+					{
+						if (pError)
+						{
+							return fReject(pError);
+						}
+						return fResolve(pResult);
+					});
+			});
+	}
+
+	/**
+	 * How often a long-running DDL statement reports that it is still alive.
+	 *
+	 * @return {number} Milliseconds; 0 disables the progress lines.
+	 */
+	_ddlProgressLogIntervalMs()
+	{
+		let tmpMSSQLSettings = this.options.MSSQL || this.fable.settings.MSSQL || {};
+		let tmpRetry = tmpMSSQLSettings.DDLRetryOptions || {};
+		if (typeof(tmpRetry.ProgressLogIntervalMs) === 'number' && tmpRetry.ProgressLogIntervalMs >= 0)
+		{
+			return tmpRetry.ProgressLogIntervalMs;
+		}
+		return DDL_PROGRESS_LOG_INTERVAL_MS;
+	}
+
+	/**
+	 * Build the request a DDL statement runs on, carrying the DDL ceiling rather
+	 * than the pool's per-query one. Its own method so tests can substitute a
+	 * request without a live server.
+	 *
+	 * @return {Object} An mssql Request bound to the connection pool.
+	 */
+	_createDDLRequest()
+	{
+		return new libMSSQL.Request(this._ConnectionPool, { requestTimeout: this._ddlRequestTimeoutMs() });
+	}
+
+	/**
+	 * Run one DDL statement on its own budget, reporting progress while it runs.
+	 *
+	 * @param {string} pStatement - The DDL SQL to execute.
+	 * @param {string} pOperationName - Label for the progress lines.
+	 * @param {(pError: Error|null, pResult?: Object) => void} fCallback
+	 */
+	_executeDDLStatement(pStatement, pOperationName, fCallback)
+	{
+		let tmpRequest = this._createDDLRequest();
+
+		let tmpStartedMs = Date.now();
+		let tmpSettled = false;
+		let tmpProgressIntervalMs = this._ddlProgressLogIntervalMs();
+		let tmpProgressTimer = (tmpProgressIntervalMs > 0) ? setInterval(() =>
+			{
+				this.log.info(`${pOperationName}: still running (${((Date.now() - tmpStartedMs) / 60000).toFixed(1)} min elapsed)...`);
+			}, tmpProgressIntervalMs) : null;
+		if (tmpProgressTimer && typeof(tmpProgressTimer.unref) === 'function')
+		{
+			tmpProgressTimer.unref();
+		}
+
+		let fSettle = (pError, pResult) =>
+		{
+			if (tmpSettled)
+			{
+				return;
+			}
+			tmpSettled = true;
+			if (tmpProgressTimer)
+			{
+				clearInterval(tmpProgressTimer);
+			}
+			return fCallback(pError, pResult);
+		};
+
+		tmpRequest.query(pStatement)
+			.then((pResult) => fSettle(null, pResult))
+			.catch((pError) => fSettle(pError));
+	}
+
 	_ddlRetryOptions(pOperationName)
 	{
 		let tmpMSSQLSettings = this.options.MSSQL || this.fable.settings.MSSQL || {};
@@ -84,6 +210,14 @@ class MeadowSchemaMSSQL extends libFableServiceProviderBase
 				// cap would abort a real index build and re-abort it every retry.
 				// Set MSSQL.DDLRetryOptions.OperationTimeoutMs where the DDL is
 				// known to be bounded.  0 = rely on retries + pool recycle only.
+				//
+				// The statement's own ceiling is _ddlRequestTimeoutMs(), NOT the
+				// pool's requestTimeout — see _executeDDLStatement. Because that
+				// ceiling is already generous, hitting it means the work does not
+				// fit rather than that the server hiccuped, so it is terminal
+				// here: five replays would spend five ceilings and discard the
+				// partial build each time.
+				NonRetryableModes: [libRetry.ERROR_MODES.RequestTimeout],
 				OperationTimeoutMs: tmpRetry.OperationTimeoutMs || 0,
 				// "AlreadyExists" is always treated as success for DDL — a
 				// re-deploy will naturally hit tables that already exist.
@@ -242,7 +376,7 @@ class MeadowSchemaMSSQL extends libFableServiceProviderBase
 			this._ddlRetryOptions(`Meadow-MSSQL CREATE TABLE ${tmpTableName}`),
 			(fAttemptDone) =>
 			{
-				this._ConnectionPool.query(tmpCreateTableStatement)
+				this._executeDDLStatementPromise(tmpCreateTableStatement, `Meadow-MSSQL CREATE TABLE ${tmpTableName}`)
 					.then((pResult) => fAttemptDone(null, pResult))
 					.catch((pError) => fAttemptDone(pError));
 			},
@@ -478,7 +612,7 @@ class MeadowSchemaMSSQL extends libFableServiceProviderBase
 							// outer callback can log the "already exists" case.
 							return fAttemptDone(null, { AlreadyExisted: true });
 						}
-						this._ConnectionPool.query(pIndexStatement.Statement)
+						this._executeDDLStatementPromise(pIndexStatement.Statement, `Meadow-MSSQL CREATE INDEX ${pIndexStatement.Name}`)
 							.then(() => fAttemptDone(null, { AlreadyExisted: false }))
 							.catch((pCreateError) => fAttemptDone(pCreateError));
 					})
@@ -523,7 +657,7 @@ class MeadowSchemaMSSQL extends libFableServiceProviderBase
 			this._ddlRetryOptions(`Meadow-MSSQL DROP INDEX ${pIndexName}`),
 			(fAttemptDone) =>
 			{
-				this._ConnectionPool.query(tmpStatement)
+				this._executeDDLStatementPromise(tmpStatement, `Meadow-MSSQL DROP INDEX ${pIndexName}`)
 					.then(() => { return fAttemptDone(null); })
 					.catch((pDropError) => { return fAttemptDone(pDropError); });
 			},

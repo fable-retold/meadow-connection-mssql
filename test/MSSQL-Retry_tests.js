@@ -437,5 +437,61 @@ suite('Meadow-MSSQL-Retry',
 								} catch (e) { fDone(e); }
 							});
 					});
+
+
+		suite('NonRetryableModes',
+			() =>
+			{
+				test('a mode listed as non-retryable is terminal even though it is normally transient',
+					(fDone) =>
+					{
+						// The DDL case: once a statement has its own generous
+						// ceiling, hitting it means the work does not fit. Replaying
+						// spends the same ceiling again and discards the partial
+						// build -- on the customer's server, every run.
+						let log = makeTestLogger();
+						let tmpAttempts = 0;
+						libRetry.runWithRetry(log,
+							{
+								OperationName: 'CREATE INDEX Huge',
+								MaxAttempts: 5,
+								InitialDelayMs: 1,
+								NonRetryableModes: [libRetry.ERROR_MODES.RequestTimeout]
+							},
+							(fAttemptDone) => { tmpAttempts++; return fAttemptDone(timeoutError()); },
+							(pError) =>
+							{
+								try
+								{
+									Expect(pError).to.be.an.instanceof(Error);
+									Expect(tmpAttempts).to.equal(1);
+									let tmpTerminal = log.records.filter((r) => r.message.indexOf('terminal for this operation') >= 0);
+									Expect(tmpTerminal.length).to.equal(1);
+									fDone();
+								} catch (e) { fDone(e); }
+							});
+					});
+
+				test('without the option the same mode still retries to exhaustion',
+					(fDone) =>
+					{
+						// Guards the blast radius: this must not change retry
+						// behaviour for DML or connects.
+						let log = makeTestLogger();
+						let tmpAttempts = 0;
+						libRetry.runWithRetry(log,
+							{ OperationName: 'Query', MaxAttempts: 3, InitialDelayMs: 1 },
+							(fAttemptDone) => { tmpAttempts++; return fAttemptDone(timeoutError()); },
+							(pError) =>
+							{
+								try
+								{
+									Expect(pError).to.be.an.instanceof(Error);
+									Expect(tmpAttempts).to.equal(3);
+									fDone();
+								} catch (e) { fDone(e); }
+							});
+					});
+			});
 			});
 	});

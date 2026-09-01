@@ -245,7 +245,7 @@ function classifyError(pError, pElapsedMs, pPriorInfo)
  *   [info]  Meadow-MSSQL CREATE TABLE Sample: succeeded on attempt 2 (elapsed 3542ms)
  *
  * @param {Object}   pLog       — a fable logger (has .info, .warn, .error)
- * @param {Object}   pOptions   — { OperationName, MaxAttempts, InitialDelayMs, MaxDelayMs, BackoffFactor, PoolRecycleModes, OnRecyclePool, SuccessModes }
+ * @param {Object}   pOptions   — { OperationName, MaxAttempts, InitialDelayMs, MaxDelayMs, BackoffFactor, PoolRecycleModes, OnRecyclePool, SuccessModes, NonRetryableModes }
  * @param {Function} fOperation — (fDone) => ... where fDone(err, result)
  * @param {Function} fCallback  — (err, result) => ...
  */
@@ -255,6 +255,14 @@ function runWithRetry(pLog, pOptions, fOperation, fCallback)
 	let tmpOpName = tmpOptions.OperationName || 'Meadow-MSSQL operation';
 	let tmpPriorInfo = null;
 	let tmpAttempt = 0;
+
+	// NonRetryableModes lets a caller declare that a mode which is generally
+	// transient is terminal for THIS operation.  DDL uses it for RequestTimeout:
+	// once an operation has been given its own generous ceiling, hitting that
+	// ceiling means the work does not fit, and replaying it identically just
+	// spends the same ceiling again -- on a customer's server, discarding real
+	// work each time.
+	let tmpNonRetryableModes = tmpOptions.NonRetryableModes || [];
 
 	// SuccessModes lets callers treat certain failure modes as success
 	// (e.g. AlreadyExists for CREATE TABLE — not really an error).
@@ -313,6 +321,11 @@ function runWithRetry(pLog, pOptions, fOperation, fCallback)
 			if (!tmpInfo.isRetryable)
 			{
 				pLog.error(`${tmpOpName}: giving up — ${tmpInfo.mode} is not retryable`);
+				return fCallback(pError);
+			}
+			if (tmpNonRetryableModes.indexOf(tmpInfo.mode) >= 0)
+			{
+				pLog.error(`${tmpOpName}: giving up — ${tmpInfo.mode} is terminal for this operation; retrying would only spend the same ceiling again`);
 				return fCallback(pError);
 			}
 			if (tmpAttempt >= tmpOptions.MaxAttempts)

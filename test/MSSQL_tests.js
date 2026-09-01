@@ -925,5 +925,122 @@ suite
 				);
 			}
 		);
+
+		suite
+			(
+				'DDL Statement Budget',
+				() =>
+				{
+					// A schema change is not a query. Inheriting the pool's
+					// per-query requestTimeout is what aborted a legitimate
+					// CREATE INDEX at 2 minutes and re-aborted it every retry.
+					let fMakeSchemaProvider = (pMSSQLSettings) =>
+					{
+						let tmpFable = new libFable({ Product: 'DDLBudgetTest', LogStreams: [ { streamtype: 'console', level: 'fatal' } ] });
+						tmpFable.settings.MSSQL = pMSSQLSettings || {};
+						tmpFable.serviceManager.addServiceType('MeadowSchemaMSSQL', libMeadowSchemaMSSQL);
+						let tmpProvider = tmpFable.serviceManager.instantiateServiceProvider('MeadowSchemaMSSQL');
+						tmpProvider._ConnectionPool = {};
+						return tmpProvider;
+					};
+
+					test
+						(
+							'DDL defaults to its own generous ceiling, not the pool per-query one',
+							() =>
+							{
+								let tmpProvider = fMakeSchemaProvider({ RequestTimeoutMs: 120000 });
+								Expect(tmpProvider._ddlRequestTimeoutMs()).to.equal(1800000);
+								// The pool value must not leak into DDL.
+								Expect(tmpProvider._ddlRequestTimeoutMs()).to.not.equal(120000);
+							}
+						);
+
+					test
+						(
+							'the DDL ceiling is configurable, and 0 means no client-side ceiling',
+							() =>
+							{
+								Expect(fMakeSchemaProvider({ DDLRetryOptions: { RequestTimeoutMs: 5400000 } })._ddlRequestTimeoutMs()).to.equal(5400000);
+								Expect(fMakeSchemaProvider({ DDLRetryOptions: { RequestTimeoutMs: 0 } })._ddlRequestTimeoutMs()).to.equal(0);
+							}
+						);
+
+					test
+						(
+							'RequestTimeout is terminal for DDL so a doomed build is attempted once',
+							() =>
+							{
+								let tmpOptions = fMakeSchemaProvider({})._ddlRetryOptions('CREATE INDEX Huge');
+								Expect(tmpOptions.NonRetryableModes).to.be.an('array');
+								Expect(tmpOptions.NonRetryableModes).to.contain('RequestTimeout');
+							}
+						);
+
+					test
+						(
+							'a long DDL statement reports progress while it runs, and stops on completion',
+							(fDone) =>
+							{
+								// Silence is indistinguishable from a wedge to anything
+								// watching the log -- including the data cloner's
+								// pipeline watchdog, which would kill a healthy build.
+								let tmpProvider = fMakeSchemaProvider({ DDLRetryOptions: { ProgressLogIntervalMs: 20 } });
+								let tmpProgressLines = [];
+								tmpProvider.log.info = (pMessage) => { tmpProgressLines.push(String(pMessage)); };
+
+								let tmpAppliedTimeout = null;
+								tmpProvider._createDDLRequest = () =>
+									{
+										tmpAppliedTimeout = tmpProvider._ddlRequestTimeoutMs();
+										return { query: () => new Promise((fResolve) => setTimeout(() => fResolve({ rowsAffected: [ 0 ] }), 120)) };
+									};
+
+								tmpProvider._executeDDLStatement('CREATE INDEX IX_Huge ON dbo.Huge (GUIDHuge)', 'Meadow-MSSQL CREATE INDEX IX_Huge',
+									(pError) =>
+									{
+										Expect(pError).to.equal(null);
+										Expect(tmpAppliedTimeout).to.equal(1800000);
+										let tmpStillRunning = tmpProgressLines.filter((pLine) => pLine.indexOf('still running') >= 0);
+										Expect(tmpStillRunning.length).to.be.greaterThan(0);
+										let tmpCountAtSettle = tmpStillRunning.length;
+										// Nothing may be logged after the callback fires.
+										setTimeout(() =>
+											{
+												Expect(tmpProgressLines.filter((pLine) => pLine.indexOf('still running') >= 0).length).to.equal(tmpCountAtSettle);
+												fDone();
+											}, 80);
+									});
+							}
+						);
+
+					test
+						(
+							'a failing DDL statement still stops its progress timer',
+							(fDone) =>
+							{
+								let tmpProvider = fMakeSchemaProvider({ DDLRetryOptions: { ProgressLogIntervalMs: 20 } });
+								let tmpProgressLines = [];
+								tmpProvider.log.info = (pMessage) => { tmpProgressLines.push(String(pMessage)); };
+								tmpProvider._createDDLRequest = () =>
+									{
+										return { query: () => new Promise((fResolve, fReject) => setTimeout(() => fReject(new Error('Timeout: Request failed to complete in 1800000ms')), 60)) };
+									};
+
+								tmpProvider._executeDDLStatement('CREATE INDEX IX_Huge ON dbo.Huge (GUIDHuge)', 'Meadow-MSSQL CREATE INDEX IX_Huge',
+									(pError) =>
+									{
+										Expect(pError).to.be.an.instanceof(Error);
+										let tmpCountAtSettle = tmpProgressLines.length;
+										setTimeout(() =>
+											{
+												Expect(tmpProgressLines.length).to.equal(tmpCountAtSettle);
+												fDone();
+											}, 80);
+									});
+							}
+						);
+				}
+			);
 	}
 );
