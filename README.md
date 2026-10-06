@@ -158,15 +158,78 @@ Generate a safe `DROP TABLE` statement using `IF OBJECT_ID` to check existence b
 
 | Meadow Type | MSSQL Column |
 |-------------|--------------|
-| `ID` | `INT NOT NULL IDENTITY PRIMARY KEY` |
-| `GUID` | `VARCHAR(254)` with default GUID |
-| `ForeignKey` | `INT UNSIGNED NOT NULL DEFAULT 0` |
+| `ID` | `BIGINT NOT NULL IDENTITY PRIMARY KEY` (see [Integer Width](#integer-width)) |
+| `GUID` | `NCHAR(size, default 255) NOT NULL` with default GUID |
+| `ForeignKey` | `BIGINT NOT NULL DEFAULT 0` (see [Integer Width](#integer-width)) |
 | `Numeric` | `INT NOT NULL DEFAULT 0` |
 | `Decimal` | `DECIMAL(size)` |
 | `String` | `VARCHAR(size) DEFAULT ''` |
 | `Text` | `TEXT` |
 | `DateTime` | `DATETIME` |
 | `Boolean` | `TINYINT DEFAULT 0` |
+
+## Integer Width
+
+Stricture records each integer column's logical type as `Signed` + `Precision` + `Radix`, using SQL `INFORMATION_SCHEMA` naming (see the stricture README). Schemas compiled before that are read with Stricture's defaults: `ID` and `ForeignKey` unsigned 32-bit, `Numeric` signed 32-bit.
+
+MSSQL has no unsigned integer types beyond `TINYINT`, so this connector stores each column in the narrowest native type that holds its whole range (`getNativeIntegerType`):
+
+| Logical type | MSSQL type |
+|--------------|------------|
+| unsigned 32-bit (`ID`, `ForeignKey`) | `BIGINT` |
+| signed 32-bit (`Numeric`) | `INT` |
+| signed 64-bit | `BIGINT` |
+| unsigned 8-bit | `TINYINT` |
+
+Connector versions before 1.0.27 created `ID` and `ForeignKey` columns as `INT`, which rejects every value above 2,147,483,647.
+
+Related behavior:
+
+- `introspectTableColumns` reports what each integer column can physically hold, in the same terms: an `INT` column is `{ Signed: true, Precision: 32, Radix: 2 }`. meadow-migrationmanager's `SchemaDiff` compares that against the schema by range. It flags an `INT` holding unsigned 32-bit IDs, and accepts `BIGINT` because its range covers them.
+- `BIGINT` results are returned as JavaScript numbers while they are exact (up to 2^53), matching the MySQL connector. Larger values stay strings.
+
+### `migrateColumns(pTableName, pColumnModifications, fCallback)`
+
+Takes a table's `ColumnsModified` entries from a schema diff and carries out the ones this connector must do itself. Currently that is a column whose only change is `IntegerRange`, meaning it is too narrow for its logical type. All such columns are widened together in a single `widenIntegerColumns` rebuild.
+
+The callback receives `{ Handled: [column names], Result }`. Claimed columns are listed even if the rebuild fails, so the caller doesn't fall back to an `ALTER COLUMN` that can't work. retold-data-service's data cloner calls this from its schema check.
+
+### `widenIntegerColumns(pTableName, pColumnTypes, [pOptions], fCallback)`
+
+Widens the named integer columns (`{ IDWidget: 'BIGINT', IDOwner: 'BIGINT' }`) by rebuilding the table, all in one pass. MSSQL can't retype an identity key in place, and an in-place `ALTER COLUMN` rewrites every row in a single transaction.
+
+The live table stays readable throughout. Readers are only blocked for the final rename.
+
+1. Creates `<Table>__MeadowWiden` from the live table's own definition (`SELECT INTO`), with the requested columns widened (nullability kept), the original defaults, and the clustered primary key.
+2. Copies rows in identity order, in batches that each commit separately. This keeps transaction log use per batch small. If the process dies, the next call resumes from the shadow table's highest ID.
+3. Checks that row count and `MAX(identity)` match the live table. On a mismatch it drops the shadow table and fails.
+4. Recreates secondary indexes (with key order, `INCLUDE` columns and filters) and object-level `GRANT`/`DENY` permissions on the shadow table.
+5. In one transaction, renames the live table to `<Table>__MeadowRetired` and the shadow table to `<Table>`. It waits at most 30s for a schema lock and retries up to 5 times.
+6. Refreshes views that reference the table, then drops the retired table.
+
+The table needs an identity column to order the copy. The rebuild refuses, without changing anything, if a rename swap would break other objects:
+
+- foreign keys from other tables pointing at this one
+- schema-bound views or functions
+- triggers
+- computed columns
+- columnstore, XML or spatial indexes, or a clustered index that is not the primary key
+
+It never narrows a column. When every requested column is already wide enough it does nothing, apart from removing leftover shadow or retired tables.
+
+Measured on SQL Server 2017:
+
+- 2M narrow rows: 5.5s, at most 23 MB of log per batch, and a 102 ms rename. An in-place `ALTER COLUMN` took 10.4s and held 849 MB of log in a single transaction.
+- 1M `Observation`-shaped rows (2.2 GB): 37.5s, about 59 MB/s.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `BatchSize` | `50000` | Rows per copy transaction |
+| `RetainRetiredTable` | `false` | Keep the old table as `<Table>__MeadowRetired` instead of dropping it |
+
+Defaults can also be set in the connection config as `MSSQL.IntegerWidenOptions`.
+
+Disk: the shadow table temporarily doubles the table's size. Under the FULL recovery model, log space is only freed by the regular log backups.
 
 ## Part of the Retold Framework
 
@@ -186,6 +249,12 @@ Run the test suite:
 
 ```bash
 npm test
+```
+
+The live suites expect the test container on port 21433 (`npm run docker-mssql-start`, SQL Server 2022). To run them against another server, for example a SQL Server 2017 container, set `MSSQL_TEST_PORT`:
+
+```bash
+MSSQL_TEST_PORT=21434 npm test
 ```
 
 Run with coverage:

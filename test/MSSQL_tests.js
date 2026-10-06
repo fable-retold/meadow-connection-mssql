@@ -34,7 +34,9 @@ const _FableConfig = (
 		"MSSQL":
 			{
 				"server": "localhost",
-				"port": 21433,
+				// MSSQL_TEST_PORT points the live suites at another server
+				// (e.g. a SQL Server 2017 container) without editing this file.
+				"port": parseInt(process.env.MSSQL_TEST_PORT, 10) || 21433,
 				"user": "sa",
 				"password": "Retold1234567890!",
 				"database": "bookstore",
@@ -1038,6 +1040,332 @@ suite
 												fDone();
 											}, 80);
 									});
+							}
+						);
+				}
+			);
+
+		suite
+			(
+				'Integer Widening',
+				() =>
+				{
+					let fSchemaProvider = () =>
+					{
+						let tmpFable = new libFable({ Product: 'WidenDDLTest', LogStreams: [ { streamtype: 'console', level: 'fatal' } ] });
+						tmpFable.serviceManager.addServiceType('MeadowSchemaMSSQL', libMeadowSchemaMSSQL);
+						return tmpFable.serviceManager.instantiateServiceProvider('MeadowSchemaMSSQL');
+					};
+
+					test
+						(
+							'logical integer types map to the narrowest MSSQL type that holds them (no unsigned types, so unsigned 32-bit is BIGINT)',
+							() =>
+							{
+								let tmpProvider = fSchemaProvider();
+								Expect(tmpProvider.getNativeIntegerType({ Signed: false, Precision: 32, Radix: 2 })).to.equal('BIGINT');
+								Expect(tmpProvider.getNativeIntegerType({ Signed: true, Precision: 32, Radix: 2 })).to.equal('INT');
+								Expect(tmpProvider.getNativeIntegerType({ Signed: false, Precision: 16, Radix: 2 })).to.equal('INT');
+								Expect(tmpProvider.getNativeIntegerType({ Signed: true, Precision: 16, Radix: 2 })).to.equal('SMALLINT');
+								Expect(tmpProvider.getNativeIntegerType({ Signed: false, Precision: 8, Radix: 2 })).to.equal('TINYINT');
+								Expect(tmpProvider.getNativeIntegerType({ Signed: true, Precision: 8, Radix: 2 })).to.equal('SMALLINT');
+								Expect(tmpProvider.getNativeIntegerType({ Signed: true, Precision: 64, Radix: 2 })).to.equal('BIGINT');
+								// Decimal-digit precision, as INFORMATION_SCHEMA reports it: 10 digits needs BIGINT.
+								Expect(tmpProvider.getNativeIntegerType({ Signed: false, Precision: 10, Radix: 10 })).to.equal('BIGINT');
+								Expect(tmpProvider.getNativeIntegerType({ Signed: true, Precision: 9, Radix: 10 })).to.equal('INT');
+							}
+						);
+
+					test
+						(
+							'CREATE TABLE uses each column\'s logical integer type, defaulting from DataType for older schemas',
+							() =>
+							{
+								let tmpProvider = fSchemaProvider();
+								// _FableTestTableSchema predates Signed/Precision/Radix: ID and
+								// ForeignKey default to unsigned 32-bit.
+								let tmpStatement = tmpProvider.generateCreateTableStatement(_FableTestTableSchema);
+								Expect(tmpStatement).to.contain('[IDFableTest] BIGINT NOT NULL IDENTITY PRIMARY KEY');
+								Expect(tmpStatement).to.contain('[IDAuthor] BIGINT NOT NULL DEFAULT 0');
+
+								let tmpExplicit = tmpProvider.generateCreateTableStatement(
+									{
+										TableName: 'Explicit',
+										Columns:
+										[
+											{ Column: 'IDExplicit', DataType: 'ID', Signed: true, Precision: 32, Radix: 2 },
+											{ Column: 'IDProject', DataType: 'Numeric', Size: 'int', Signed: true, Precision: 32, Radix: 2 },
+											{ Column: 'ByteCount', DataType: 'Numeric', Signed: true, Precision: 64, Radix: 2 }
+										]
+									});
+								Expect(tmpExplicit).to.contain('[IDExplicit] INT NOT NULL IDENTITY PRIMARY KEY');
+								Expect(tmpExplicit).to.contain('[IDProject] INT NOT NULL DEFAULT 0');
+								Expect(tmpExplicit).to.contain('[ByteCount] BIGINT NOT NULL DEFAULT 0');
+							}
+						);
+
+					test
+						(
+							'migrateColumns claims only pure integer-range changes',
+							(fDone) =>
+							{
+								let tmpProvider = fSchemaProvider();
+								let tmpRequested = null;
+								tmpProvider.widenIntegerColumns = (pTable, pColumnTypes, pOptions, fCallback) => { tmpRequested = pColumnTypes; fCallback(null, { Widened: true }); };
+								tmpProvider.migrateColumns('Join',
+									[
+										{ Column: 'IDJoin', DataType: 'ID', Changes: { IntegerRange: { From: { Signed: true, Precision: 32, Radix: 2 }, To: { Signed: false, Precision: 32, Radix: 2 } } } },
+										{ Column: 'Tag', DataType: 'String', Changes: { Size: { From: '64', To: '128' } } },
+										{ Column: 'IDOther', DataType: 'Numeric', Changes: { DataType: { From: 'String', To: 'Numeric' }, IntegerRange: { From: { Signed: true, Precision: 16, Radix: 2 }, To: { Signed: true, Precision: 32, Radix: 2 } } } }
+									],
+									(pError, pResult) =>
+									{
+										Expect(pError).to.equal(null);
+										Expect(pResult.Handled).to.deep.equal([ 'IDJoin' ]);
+										Expect(tmpRequested).to.deep.equal({ IDJoin: 'BIGINT' });
+										tmpProvider.migrateColumns('Join', [ { Column: 'Tag', Changes: { Size: { From: '64', To: '128' } } } ],
+											(pNoneError, pNone) =>
+											{
+												Expect(pNone.Handled).to.deep.equal([]);
+												fDone();
+											});
+									});
+							}
+						);
+
+					test
+						(
+							'BIGINT results come back as numbers while exact, strings beyond 2^53',
+							() =>
+							{
+								let fCoerce = libMeadowConnectionMSSQL.coerceBigInt;
+								Expect(fCoerce('2581798026')).to.equal(2581798026);
+								Expect(fCoerce('-5')).to.equal(-5);
+								Expect(fCoerce('9007199254740993')).to.equal('9007199254740993');
+								Expect(fCoerce(null)).to.equal(null);
+								Expect(fCoerce(7)).to.equal(7);
+							}
+						);
+
+					suite
+						(
+							'against a live server',
+							() =>
+							{
+								let _Fable = null;
+								let _Schema = null;
+								let fQuery = (pSQL) => _Fable.MeadowMSSQLProvider.pool.query(pSQL);
+								let fColumnType = (pTable, pColumn) => fQuery(`SELECT t.name AS TypeName, c.is_identity AS IsIdentity FROM sys.columns c JOIN sys.types t ON t.user_type_id = c.user_type_id WHERE c.object_id = OBJECT_ID('dbo.${pTable}') AND c.name = '${pColumn}'`).then((pResult) => pResult.recordset[0]);
+
+								// The pre-BIGINT DDL, verbatim, plus the things a rebuild
+								// must carry across: a default, the meadow sync indexes, a
+								// grant, and sparse IDs so batches straddle gaps.
+								let fCreateLegacyTable = (pTable, pRows) =>
+								{
+									return fQuery(`
+IF OBJECT_ID('dbo.[${pTable}]', 'U') IS NOT NULL DROP TABLE dbo.[${pTable}];
+IF OBJECT_ID('dbo.[${pTable}__MeadowWiden]', 'U') IS NOT NULL DROP TABLE dbo.[${pTable}__MeadowWiden];
+IF OBJECT_ID('dbo.[${pTable}__MeadowRetired]', 'U') IS NOT NULL DROP TABLE dbo.[${pTable}__MeadowRetired];
+CREATE TABLE [dbo].[${pTable}] ([ID${pTable}] INT NOT NULL IDENTITY PRIMARY KEY, [GUID${pTable}] NCHAR(255) NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000', [Tag] VARCHAR(64) DEFAULT '', [IDLinked] INT NULL, [Deleted] TINYINT DEFAULT 0);
+CREATE INDEX [IX_M_SYNC_${pTable}_GUID] ON [dbo].[${pTable}] ([GUID${pTable}]);
+CREATE INDEX [IX_M_SYNC_${pTable}_Deleted] ON [dbo].[${pTable}] ([Deleted], [ID${pTable}]) INCLUDE ([Tag]);
+IF DATABASE_PRINCIPAL_ID('WidenTestReader') IS NULL CREATE ROLE WidenTestReader;
+GRANT SELECT ON [dbo].[${pTable}] TO WidenTestReader;
+SET IDENTITY_INSERT [dbo].[${pTable}] ON;
+WITH n AS (SELECT TOP (${pRows}) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS i FROM sys.all_objects a CROSS JOIN sys.all_objects b)
+INSERT INTO [dbo].[${pTable}] ([ID${pTable}], [GUID${pTable}], [Tag]) SELECT i * 7 + 1000, CONCAT('g-', i), CONCAT('t', i % 13) FROM n;
+SET IDENTITY_INSERT [dbo].[${pTable}] OFF;`);
+								};
+
+								suiteSetup(
+									(fDone) =>
+									{
+										_Fable = new libFable(_FableConfig);
+										_Fable.serviceManager.addServiceType('MeadowMSSQLProvider', libMeadowConnectionMSSQL);
+										_Fable.serviceManager.instantiateServiceProvider('MeadowMSSQLProvider');
+										_Fable.MeadowMSSQLProvider.connectAsync(
+											(pError) =>
+											{
+												_Schema = _Fable.MeadowMSSQLProvider.schemaProvider;
+												return fDone(pError);
+											});
+									});
+
+								test
+									(
+										'widens an INT identity and another INT column in one rebuild, keeping rows, nullability, defaults, indexes and grants',
+										(fDone) =>
+										{
+											fCreateLegacyTable('WidenTest', 1200)
+												.then(() =>
+												{
+													_Fable.MeadowMSSQLProvider.widenIntegerColumns('WidenTest', { IDWidenTest: 'BIGINT', IDLinked: 'BIGINT' }, { BatchSize: 500 },
+														async (pError, pResult) =>
+														{
+															try
+															{
+																Expect(pError).to.equal(null);
+																Expect(pResult).to.include({ Table: 'WidenTest', Widened: true, RowsCopied: 1200, Resumed: false });
+																Expect(pResult.Columns).to.deep.equal([ { Column: 'IDWidenTest', From: 'INT', To: 'BIGINT' }, { Column: 'IDLinked', From: 'INT', To: 'BIGINT' } ]);
+																Expect(await fColumnType('WidenTest', 'IDLinked')).to.deep.equal({ TypeName: 'bigint', IsIdentity: false });
+																Expect((await fQuery(`SELECT is_nullable AS N FROM sys.columns WHERE object_id = OBJECT_ID('dbo.WidenTest') AND name = 'IDLinked'`)).recordset[0].N).to.equal(true);
+
+																Expect(await fColumnType('WidenTest', 'IDWidenTest')).to.deep.equal({ TypeName: 'bigint', IsIdentity: true });
+																let tmpState = (await fQuery(`SELECT COUNT(*) AS N, MAX(IDWidenTest) AS MaxID, CAST(IDENT_CURRENT('dbo.WidenTest') AS BIGINT) AS Ident,
+																	OBJECT_ID('dbo.WidenTest__MeadowRetired') AS Retired, OBJECT_ID('dbo.WidenTest__MeadowWiden') AS Shadow,
+																	(SELECT COUNT(*) FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.WidenTest') AND name LIKE 'IX_M_SYNC_WidenTest_%') AS SyncIndexes,
+																	(SELECT COUNT(*) FROM sys.index_columns ic JOIN sys.indexes i ON i.object_id = ic.object_id AND i.index_id = ic.index_id WHERE i.name = 'IX_M_SYNC_WidenTest_Deleted' AND i.object_id = OBJECT_ID('dbo.WidenTest') AND ic.is_included_column = 1) AS Included,
+																	(SELECT COUNT(*) FROM sys.database_permissions WHERE major_id = OBJECT_ID('dbo.WidenTest') AND USER_NAME(grantee_principal_id) = 'WidenTestReader' AND permission_name = 'SELECT') AS Grants,
+																	(SELECT COUNT(*) FROM sys.default_constraints WHERE parent_object_id = OBJECT_ID('dbo.WidenTest')) AS Defaults
+																	FROM dbo.WidenTest`)).recordset[0];
+																Expect(tmpState).to.deep.equal({ N: 1200, MaxID: 1200 * 7 + 1000, Ident: 1200 * 7 + 1000, Retired: null, Shadow: null, SyncIndexes: 2, Included: 1, Grants: 1, Defaults: 3 });
+
+																// The point of the exercise: IDs past the INT ceiling.
+																await fQuery(`SET IDENTITY_INSERT dbo.WidenTest ON; INSERT INTO dbo.WidenTest (IDWidenTest, GUIDWidenTest) VALUES (2581798026, 'big'); SET IDENTITY_INSERT dbo.WidenTest OFF;`);
+																let tmpBig = (await fQuery(`SELECT IDWidenTest, Tag, Deleted FROM dbo.WidenTest WHERE GUIDWidenTest = 'big'`)).recordset[0];
+																Expect(tmpBig).to.deep.equal({ IDWidenTest: 2581798026, Tag: '', Deleted: 0 });
+																fDone();
+															}
+															catch (pAssertError)
+															{
+																fDone(pAssertError);
+															}
+														});
+												})
+												.catch(fDone);
+										}
+									);
+
+								test
+									(
+										'is a no-op on columns already wide enough, and never narrows',
+										(fDone) =>
+										{
+											_Fable.MeadowMSSQLProvider.widenIntegerColumns('WidenTest', { IDWidenTest: 'BIGINT', IDLinked: 'INT' }, {},
+												async (pError, pResult) =>
+												{
+													try
+													{
+														Expect(pError).to.equal(null);
+														Expect(pResult.Widened).to.equal(false);
+														Expect(pResult.Columns).to.deep.equal([]);
+														Expect(await fColumnType('WidenTest', 'IDLinked')).to.deep.equal({ TypeName: 'bigint', IsIdentity: false });
+														fDone();
+													}
+													catch (pAssertError)
+													{
+														fDone(pAssertError);
+													}
+												});
+										}
+									);
+
+								test
+									(
+										'resumes from the shadow table after a run dies mid-copy',
+										(fDone) =>
+										{
+											fCreateLegacyTable('WidenResume', 1000)
+												.then(() =>
+												{
+													// Kill the first run on its third copy batch.
+													let tmpRealQuery = _Schema._widenQuery.bind(_Schema);
+													let tmpBatches = 0;
+													_Schema._widenQuery = (pStatement, pOperation) =>
+													{
+														if (pOperation.endsWith('copy batch') && (++tmpBatches === 3))
+														{
+															return Promise.reject(new Error('simulated crash'));
+														}
+														return tmpRealQuery(pStatement, pOperation);
+													};
+													_Fable.MeadowMSSQLProvider.widenIntegerColumns('WidenResume', { IDWidenResume: 'BIGINT' }, { BatchSize: 300 },
+														async (pFirstError) =>
+														{
+															_Schema._widenQuery = tmpRealQuery;
+															try
+															{
+																Expect(pFirstError.message).to.equal('simulated crash');
+																Expect(await fColumnType('WidenResume', 'IDWidenResume')).to.deep.equal({ TypeName: 'int', IsIdentity: true });
+																Expect((await fQuery(`SELECT COUNT(*) AS N FROM dbo.WidenResume__MeadowWiden`)).recordset[0].N).to.equal(600);
+															}
+															catch (pAssertError)
+															{
+																return fDone(pAssertError);
+															}
+															_Fable.MeadowMSSQLProvider.widenIntegerColumns('WidenResume', { IDWidenResume: 'BIGINT' }, { BatchSize: 300 },
+																async (pError, pResult) =>
+																{
+																	try
+																	{
+																		Expect(pError).to.equal(null);
+																		Expect(pResult).to.include({ Widened: true, Resumed: true, RowsCopied: 400 });
+																		Expect(await fColumnType('WidenResume', 'IDWidenResume')).to.deep.equal({ TypeName: 'bigint', IsIdentity: true });
+																		Expect((await fQuery(`SELECT COUNT(*) AS N FROM dbo.WidenResume`)).recordset[0].N).to.equal(1000);
+																		fDone();
+																	}
+																	catch (pAssertError)
+																	{
+																		fDone(pAssertError);
+																	}
+																});
+														});
+												})
+												.catch(fDone);
+										}
+									);
+
+								test
+									(
+										'refuses, changing nothing, when a rename swap would orphan a trigger',
+										(fDone) =>
+										{
+											fCreateLegacyTable('WidenBlocked', 10)
+												.then(() => fQuery(`EXEC('CREATE TRIGGER TR_WidenBlocked ON dbo.WidenBlocked AFTER INSERT AS SET NOCOUNT ON;')`))
+												.then(() =>
+												{
+													_Fable.MeadowMSSQLProvider.widenIntegerColumns('WidenBlocked', { IDWidenBlocked: 'BIGINT' }, {},
+														async (pError) =>
+														{
+															try
+															{
+																Expect(pError.message).to.contain('Trigger TR_WidenBlocked');
+																Expect(await fColumnType('WidenBlocked', 'IDWidenBlocked')).to.deep.equal({ TypeName: 'int', IsIdentity: true });
+																Expect((await fQuery(`SELECT OBJECT_ID('dbo.WidenBlocked__MeadowWiden') AS Shadow`)).recordset[0].Shadow).to.equal(null);
+																fDone();
+															}
+															catch (pAssertError)
+															{
+																fDone(pAssertError);
+															}
+														});
+												})
+												.catch(fDone);
+										}
+									);
+
+								test
+									(
+										'introspection reports what each integer column can hold, in logical terms',
+										(fDone) =>
+										{
+											fCreateLegacyTable('WidenIntrospect', 1)
+												.then(() =>
+												{
+													_Fable.MeadowMSSQLProvider.introspectTableColumns('WidenIntrospect',
+														(pError, pColumns) =>
+														{
+															Expect(pError).to.equal(null);
+															Expect(pColumns[0]).to.deep.equal({ Column: 'IDWidenIntrospect', DataType: 'ID', Signed: true, Precision: 32, Radix: 2 });
+															Expect(pColumns.find((pColumn) => pColumn.Column === 'IDLinked')).to.deep.equal({ Column: 'IDLinked', DataType: 'Numeric', Signed: true, Precision: 32, Radix: 2 });
+															// A TINYINT flag is Boolean, not an integer column.
+															Expect(pColumns.find((pColumn) => pColumn.Column === 'Deleted')).to.deep.equal({ Column: 'Deleted', DataType: 'Boolean' });
+															fDone();
+														});
+												})
+												.catch(fDone);
+										}
+									);
 							}
 						);
 				}

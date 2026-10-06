@@ -9,6 +9,31 @@ const libMSSQL = require('mssql');
 const libMeadowSchemaMSSQL = require('./Meadow-Schema-MSSQL.js');
 const libRetry = require('./Meadow-MSSQL-Retry.js');
 
+/**
+ * BIGINT arrives from tedious as a string, because JavaScript numbers lose
+ * precision past 2^53.  Identity columns are BIGINT (MSSQL's stand-in for the
+ * MySQL reference schema's INT UNSIGNED), so returning strings would hand
+ * callers `'2581798026'` where every other provider returns a number, and
+ * break `===` and arithmetic on IDs.  Return a number whenever it is exact;
+ * keep the string otherwise.
+ *
+ * The mssql value handler registry is module-wide, which is the scope we want:
+ * every pool this connector opens behaves the same way.
+ *
+ * @param {string|number|null} pValue
+ * @return {string|number|null}
+ */
+function coerceBigInt(pValue)
+{
+	if (typeof(pValue) !== 'string')
+	{
+		return pValue;
+	}
+	let tmpNumber = Number(pValue);
+	return Number.isSafeInteger(tmpNumber) ? tmpNumber : pValue;
+}
+libMSSQL.valueHandler.set(libMSSQL.TYPES.BigInt, coerceBigInt);
+
 // Default timeouts and retry behavior.  All configurable per-provider via
 // the MSSQL options block in fable settings.  Defaults lean generous for
 // slow WAN links / firewalled customer networks — better to wait a minute
@@ -86,7 +111,8 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 					ConnectionTimeoutMs: this.options.ConnectionTimeoutMs,
 					ConnectRetryOptions: this.options.ConnectRetryOptions,
 					DDLRetryOptions: this.options.DDLRetryOptions,
-					LegacyPagination: this.options.LegacyPagination
+					LegacyPagination: this.options.LegacyPagination,
+					IntegerWidenOptions: this.options.IntegerWidenOptions
 				});
 		}
 		else if (typeof(this.fable.settings.MSSQL) == 'object')
@@ -105,7 +131,8 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 					ConnectionTimeoutMs: tmpSettings.ConnectionTimeoutMs,
 					ConnectRetryOptions: tmpSettings.ConnectRetryOptions,
 					DDLRetryOptions: tmpSettings.DDLRetryOptions,
-					LegacyPagination: tmpSettings.LegacyPagination
+					LegacyPagination: tmpSettings.LegacyPagination,
+					IntegerWidenOptions: tmpSettings.IntegerWidenOptions
 				});
 		}
 
@@ -174,6 +201,16 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 	createAllIndices(pMeadowSchema, fCallback)
 	{
 		return this._SchemaProvider.createAllIndices(pMeadowSchema, fCallback);
+	}
+
+	migrateColumns(pTableName, pColumnModifications, fCallback)
+	{
+		return this._SchemaProvider.migrateColumns(pTableName, pColumnModifications, fCallback);
+	}
+
+	widenIntegerColumns(pTableName, pColumnTypes, pOptions, fCallback)
+	{
+		return this._SchemaProvider.widenIntegerColumns(pTableName, pColumnTypes, pOptions, fCallback);
 	}
 
 	// Database Introspection delegation
@@ -467,3 +504,4 @@ class MeadowConnectionMSSQL extends libFableServiceProviderBase
 }
 
 module.exports = MeadowConnectionMSSQL;
+module.exports.coerceBigInt = coerceBigInt;
